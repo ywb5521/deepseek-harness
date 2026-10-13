@@ -1,0 +1,111 @@
+name: Sync upstream and package
+
+# Keep this fork's default branch aligned with the upstream DeepSeek Harness
+# repository and rebuild the unsigned Windows and Intel macOS installers after
+# every upstream merge.
+#
+# The sync job merges the configured upstream ref into the fork's default branch
+# and pushes it. That push uses GITHUB_TOKEN, which does not trigger other
+# workflows, so this workflow calls the packaging workflow directly against the
+# merged commit instead of relying on a push event. Conflicts fail the run loudly
+# rather than choosing a side; resolve them by hand and re-run.
+#
+# The package job runs only when the merge actually advanced the default branch.
+# A daily run that finds upstream already merged pushes nothing and builds
+# nothing, so packaging is triggered by a real upstream update and never by the
+# schedule itself. A manual run may force a rebuild with force_package; the
+# packaging workflow can also be dispatched on its own for that.
+#
+# Scheduled workflows run only from the default branch, and GitHub disables them
+# after 60 days without repository activity; dispatch this workflow by hand to
+# resume. Point it at another source with the DSH_UPSTREAM_REPOSITORY and
+# DSH_UPSTREAM_REF repository variables or the per-run inputs.
+
+on:
+  workflow_dispatch:
+    inputs:
+      upstream_repository:
+        description: Upstream repository URL to merge from; empty uses the repository variable or the default.
+        type: string
+        required: false
+        default: ''
+      upstream_ref:
+        description: Upstream branch or ref to merge; empty uses the repository variable or master.
+        type: string
+        required: false
+        default: ''
+      force_package:
+        description: Rebuild the current default branch even when no upstream commit was merged (manual runs only).
+        type: boolean
+        required: false
+        default: false
+  schedule:
+    # 03:17 UTC daily, off the top-of-hour cron stampede.
+    - cron: '17 3 * * *'
+
+permissions:
+  contents: read
+
+concurrency:
+  # One sync at a time; a second run waits rather than interleaving merges.
+  group: sync-upstream
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    name: Merge upstream into the fork
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    outputs:
+      updated: ${{ steps.merge.outputs.updated }}
+      sha: ${{ steps.merge.outputs.sha }}
+    steps:
+      - uses: actions/checkout@v7.0.1
+        with:
+          ref: ${{ github.event.repository.default_branch }}
+          fetch-depth: 0
+      - name: Configure Git identity
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+      - name: Merge the upstream ref
+        id: merge
+        env:
+          UPSTREAM_REPOSITORY: ${{ inputs.upstream_repository || vars.DSH_UPSTREAM_REPOSITORY || 'https://github.com/deepseek-harness/deepseek-harness.git' }}
+          UPSTREAM_REF: ${{ inputs.upstream_ref || vars.DSH_UPSTREAM_REF || 'master' }}
+          DEFAULT_BRANCH: ${{ github.event.repository.default_branch }}
+        run: |
+          set -euo pipefail
+          # `updated` is true only when the merge moved the default branch: an
+          # upstream ref already contained in the branch is an up-to-date merge
+          # that creates no commit, so nothing is pushed and nothing is built.
+          before=$(git rev-parse HEAD)
+          git remote add upstream "$UPSTREAM_REPOSITORY"
+          git fetch --no-tags upstream "$UPSTREAM_REF"
+          git merge --no-edit FETCH_HEAD
+          after=$(git rev-parse HEAD)
+          echo "sha=$after" >> "$GITHUB_OUTPUT"
+          if [ "$before" = "$after" ]; then
+            echo "updated=false" >> "$GITHUB_OUTPUT"
+            echo 'Upstream already merged; nothing to push or build.'
+          else
+            git push origin "HEAD:$DEFAULT_BRANCH"
+            echo "updated=true" >> "$GITHUB_OUTPUT"
+            echo "Pushed $after to $DEFAULT_BRANCH."
+          fi
+
+  package:
+    name: Build unsigned packages
+    needs: sync
+    # Package only a merged upstream change. The schedule never sets force_package,
+    # so a daily run without new upstream commits skips this job entirely; a manual
+    # run can force a rebuild of the current default branch.
+    if: ${{ needs.sync.outputs.updated == 'true' || (github.event_name == 'workflow_dispatch' && inputs.force_package) }}
+    permissions:
+      contents: write
+    uses: ./.github/workflows/desktop-unsigned-package.yml
+    with:
+      source_ref: ${{ needs.sync.outputs.sha }}
+      release_tag: desktop-latest
+      policy_origin: ${{ vars.DSH_DESKTOP_POLICY_ORIGIN || 'https://download.deepseek.com' }}
